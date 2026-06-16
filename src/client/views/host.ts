@@ -1,6 +1,6 @@
 import {
   h,
-  labeled,
+  initials,
   renderErrors,
   renderTranscript,
   type Actions,
@@ -8,45 +8,12 @@ import {
   type View,
 } from "../ui.ts";
 import type { CharacterInit } from "../../shared/types.ts";
-
-type CharacterInitLike = CharacterInit;
-
-const EXAMPLE_SETTING =
-  "A dusty frontier saloon at high noon. The batwing doors creak as tensions simmer.";
-
-const EXAMPLE_CHARACTERS: CharacterInit[] = [
-  {
-    name: "Sheriff Cole",
-    persona: "A weathered frontier sheriff. Calm and gravelly, speaks in short clipped lines.",
-    voice: "onyx",
-    aliases: ["Cole", "Sheriff"],
-    secret: "Suspects the bank robbery was an inside job.",
-  },
-  {
-    name: "Maple",
-    persona: "A sharp-tongued saloon pianist who overhears everything. Witty and warm.",
-    voice: "sage",
-    aliases: ["Mae"],
-    secret: "Is quietly protecting her younger brother.",
-  },
-  {
-    name: "Bartender Sam",
-    persona: "A jittery bartender trying to keep the peace. Eager to please, talks fast.",
-    voice: "ash",
-    aliases: ["Sam", "barkeep"],
-  },
-];
-
-interface RowRefs {
-  name: HTMLInputElement;
-  persona: HTMLTextAreaElement;
-  voice: HTMLSelectElement;
-  aliases: HTMLInputElement;
-  secret: HTMLInputElement;
-}
+import { openCreateScene } from "./create-scene.ts";
 
 interface CharCtrl {
-  row: HTMLElement;
+  card: HTMLElement;
+  avatar: HTMLElement;
+  name: HTMLElement;
   dot: HTMLElement;
   status: HTMLElement;
   micBtn: HTMLButtonElement;
@@ -55,89 +22,57 @@ interface CharCtrl {
 
 export function createHostView(actions: Actions): View {
   let currentVoices: string[] = [];
-  const rowRefs = new WeakMap<HTMLElement, RowRefs>();
+  let currentScene: AppState["scene"] = null;
 
-  // ---- Setup form (persistent DOM; drafts survive re-renders) -------------
-  const settingInput = h("textarea", {
-    class: "input",
-    rows: "2",
-    placeholder: "Scene setting, e.g. A tense negotiation aboard a derelict starship",
-  }) as HTMLTextAreaElement;
-  const rowsContainer = h("div", { class: "char-rows" });
-
-  function makeRow(init?: Partial<CharacterInitLike>): HTMLElement {
-    const name = h("input", { class: "input", placeholder: "Name", value: init?.name ?? "" }) as HTMLInputElement;
-    const persona = h("textarea", { class: "input", rows: "2", placeholder: "Persona" }) as HTMLTextAreaElement;
-    if (init?.persona) persona.value = init.persona;
-    const voice = h("select", { class: "input" }) as HTMLSelectElement;
-    for (const v of currentVoices) {
-      voice.appendChild(h("option", { value: v, selected: (init?.voice ?? "alloy") === v }, v));
-    }
-    const aliases = h("input", {
-      class: "input",
-      placeholder: "Aliases (comma separated)",
-      value: (init?.aliases ?? []).join(", "),
-    }) as HTMLInputElement;
-    const secret = h("input", { class: "input", placeholder: "Secret (optional)", value: init?.secret ?? "" }) as HTMLInputElement;
-    const remove = h("button", { class: "btn small danger", onClick: () => row.remove() }, "Remove");
-
-    const row = h(
-      "div",
-      { class: "char-row" },
-      h("div", { class: "grid2" }, labeled("Name", name), labeled("Voice", voice)),
-      labeled("Persona", persona),
-      h("div", { class: "grid2" }, labeled("Aliases", aliases), labeled("Secret", secret)),
-      h("div", { class: "row end" }, remove),
-    );
-    rowRefs.set(row, { name, persona, voice, aliases, secret });
-    return row;
+  function editScene(): void {
+    const scene = currentScene;
+    const initialCast: CharacterInit[] = (scene?.characters ?? []).map((c) => ({
+      name: c.name,
+      persona: c.persona,
+      voice: c.voice,
+      aliases: c.aliases,
+      secret: c.secret,
+    }));
+    openCreateScene(actions, {
+      voices: currentVoices,
+      initialSetting: scene?.setting,
+      initialCast,
+      submitLabel: "Update scene",
+    });
   }
 
-  function addRow(init?: Partial<CharacterInitLike>): void {
-    rowsContainer.appendChild(makeRow(init));
-  }
+  // ---- Header ------------------------------------------------------------
+  const settingLine = h("div", { class: "muted small dir-setting" });
+  const editBtn = h("button", { class: "pillbtn white", onClick: () => editScene() }, "Edit scene");
+  const leaveBtn = h("button", { class: "btn", onClick: () => actions.enterLobby() }, "Leave");
 
-  function submitScene(): void {
-    const chars: CharacterInit[] = [];
-    for (const row of Array.from(rowsContainer.children)) {
-      const r = rowRefs.get(row as HTMLElement);
-      if (!r) continue;
-      const name = r.name.value.trim();
-      if (!name) continue;
-      chars.push({
-        name,
-        persona: r.persona.value.trim(),
-        voice: r.voice.value,
-        aliases: r.aliases.value.split(",").map((s) => s.trim()).filter(Boolean),
-        secret: r.secret.value.trim() || undefined,
-      });
-    }
-    actions.createScene(settingInput.value.trim(), chars);
-  }
+  // ---- Status + transport bar -------------------------------------------
+  const phaseDot = h("span", { class: "pdot" });
+  const phaseLabel = h("span", { class: "phase-label" }, "idle");
+  const phaseChip = h("span", { class: "phase-chip" }, phaseDot, phaseLabel);
+  const speakerEl = h("span", { class: "dir-speaker" });
+  const chainEl = h("span", { class: "badge muted dir-chain" }, "");
 
-  function loadExample(submit: boolean): void {
-    settingInput.value = EXAMPLE_SETTING;
-    while (rowsContainer.firstChild) rowsContainer.removeChild(rowsContainer.firstChild);
-    for (const c of EXAMPLE_CHARACTERS) addRow(c);
-    if (submit) submitScene();
-  }
-
-  const exampleBtn = h(
-    "button",
-    { class: "btn small", onClick: () => loadExample(true) },
-    "Load example",
-  );
-  const addRowBtn = h("button", { class: "btn small", onClick: () => addRow() }, "+ Add character");
-  const createBtn = h("button", { class: "btn primary", onClick: () => submitScene() }, "Create / Update scene");
-
-  // ---- Dashboard (persistent DOM) ----------------------------------------
-  const phaseBadge = h("span", { class: "badge" }, "idle");
-  const startBtn = h("button", { class: "btn primary", onClick: () => actions.start() }, "Start") as HTMLButtonElement;
+  const startBtn = h("button", { class: "pillbtn blue", onClick: () => actions.start() }, "Start") as HTMLButtonElement;
   const stopBtn = h("button", { class: "btn", onClick: () => actions.stop() }, "Stop") as HTMLButtonElement;
   const resetBtn = h("button", { class: "btn", onClick: () => actions.reset() }, "Reset");
-  const chainBadge = h("span", { class: "badge muted" }, "");
 
-  const humanInput = h("input", { class: "input", placeholder: "Speak as the human…" }) as HTMLInputElement;
+  // ---- Cast --------------------------------------------------------------
+  const castCount = h("span", { class: "panel-count" }, "0 characters");
+  const castGrid = h("div", { class: "cast-grid" });
+  const castEmpty = h(
+    "div",
+    { class: "cast-empty-state muted" },
+    "No characters yet — use Edit scene to set up the cast.",
+  );
+  castGrid.appendChild(castEmpty);
+
+  // ---- Stage (transcript + narrator composer) ---------------------------
+  const transcriptEl = h("div", { class: "transcript dir-transcript" });
+  const humanInput = h("input", {
+    class: "input",
+    placeholder: "Speak as the human…",
+  }) as HTMLInputElement;
   const sendHuman = () => {
     const t = humanInput.value.trim();
     if (t) {
@@ -148,47 +83,61 @@ export function createHostView(actions: Actions): View {
   humanInput.addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") sendHuman();
   });
-  const humanBtn = h("button", { class: "btn", onClick: sendHuman }, "Send");
+  const humanBtn = h("button", { class: "btn blue", onClick: sendHuman }, "Send");
 
-  const charControls = h("div", { class: "char-controls" });
-  const transcriptEl = h("div", { class: "transcript" });
+  // ---- Provider errors (collapsible) ------------------------------------
   const errorsEl = h("div", { class: "errors" });
+  const errorsSummary = h("summary", { class: "dir-errors-summary" }, "Provider errors");
+  const errorsPanel = h("details", { class: "dir-errors" }, errorsSummary, errorsEl);
 
   const el = h(
     "div",
-    { class: "view host-view" },
+    { class: "view director-view" },
     h(
       "div",
-      { class: "card" },
-      h("h2", null, "Scene setup"),
-      labeled("Setting", settingInput),
-      rowsContainer,
-      h("div", { class: "row" }, exampleBtn, addRowBtn, createBtn),
+      { class: "create-head" },
+      h("h1", { class: "col-title" }, "Director controls"),
+      h("div", { class: "head-actions" }, editBtn, leaveBtn),
+    ),
+    settingLine,
+    h(
+      "div",
+      { class: "dir-bar" },
+      h("div", { class: "dir-status" }, phaseChip, speakerEl, chainEl),
+      h("div", { class: "dir-transport" }, startBtn, stopBtn, resetBtn),
     ),
     h(
       "div",
-      { class: "card" },
-      h("div", { class: "row space" }, h("h2", null, "Dashboard"), h("div", { class: "row" }, chainBadge, phaseBadge)),
-      h("div", { class: "row" }, startBtn, stopBtn, resetBtn),
-      h("div", { class: "row" }, humanInput, humanBtn),
-      h("h3", null, "Characters"),
-      charControls,
+      { class: "dir-stage" },
+      h(
+        "div",
+        { class: "panel cast-panel" },
+        h("div", { class: "panel-head" }, h("h2", null, "Cast"), castCount),
+        castGrid,
+      ),
+      h(
+        "div",
+        { class: "panel stage-panel" },
+        h("div", { class: "panel-head" }, h("h2", null, "Transcript")),
+        transcriptEl,
+        h("div", { class: "composer" }, humanInput, humanBtn),
+      ),
     ),
-    h("div", { class: "card" }, h("h3", null, "Transcript"), transcriptEl),
-    h("div", { class: "card" }, h("h3", null, "Provider errors"), errorsEl),
+    errorsPanel,
   );
 
   // ---- Per-character control cache ---------------------------------------
   const ctrlCache = new Map<string, CharCtrl>();
 
   function makeCtrl(charId: string): CharCtrl {
-    const dot = h("span", { class: "dot" });
+    const avatar = h("span", { class: "avatar" });
     const name = h("span", { class: "cc-name" });
-    const status = h("span", { class: "cc-status muted" });
+    const dot = h("span", { class: "dot" });
+    const status = h("span", { class: "cc-status" });
     const micBtn = h(
       "button",
       { class: "btn small", onClick: () => onSetMic(charId) },
-      "Set mic here",
+      "Set mic",
     ) as HTMLButtonElement;
     const sayInput = h("input", { class: "input", placeholder: "Make them say…" }) as HTMLInputElement;
     const say = () => {
@@ -203,14 +152,25 @@ export function createHostView(actions: Actions): View {
     });
     const sayBtn = h("button", { class: "btn small", onClick: say }, "Say");
 
-    const row = h(
+    const card = h(
       "div",
-      { class: "cc-row" },
-      h("div", { class: "cc-head" }, dot, name, status),
-      h("div", { class: "row" }, micBtn, sayInput, sayBtn),
+      { class: "char-card" },
+      h(
+        "div",
+        { class: "cc-top" },
+        avatar,
+        h("div", { class: "cc-id" }, name, status),
+        dot,
+      ),
+      h(
+        "div",
+        { class: "cc-actions" },
+        micBtn,
+        h("div", { class: "cc-say" }, sayInput, sayBtn),
+      ),
     );
-    (name as HTMLElement).dataset.for = charId;
-    return { row, dot, status, micBtn, sayInput };
+    card.dataset.for = charId;
+    return { card, avatar, name, dot, status, micBtn, sayInput };
   }
 
   function onSetMic(charId: string): void {
@@ -218,58 +178,89 @@ export function createHostView(actions: Actions): View {
     if (ch?.claimedBy) actions.setActiveMic(ch.claimedBy);
   }
 
-  let currentScene: AppState["scene"] = null;
-  let seeded = false;
-
   function renderCharControls(state: AppState): void {
     const scene = state.scene;
     const ids = new Set(scene?.characters.map((c) => c.id) ?? []);
     for (const [id, ctrl] of ctrlCache) {
       if (!ids.has(id)) {
-        ctrl.row.remove();
+        ctrl.card.remove();
         ctrlCache.delete(id);
       }
     }
+
+    const count = scene?.characters.length ?? 0;
+    castCount.textContent = `${count} character${count === 1 ? "" : "s"}`;
+    castEmpty.style.display = count === 0 ? "" : "none";
     if (!scene) return;
+
     for (const c of scene.characters) {
       let ctrl = ctrlCache.get(c.id);
       if (!ctrl) {
         ctrl = makeCtrl(c.id);
         ctrlCache.set(c.id, ctrl);
-        charControls.appendChild(ctrl.row);
+        castGrid.appendChild(ctrl.card);
       }
-      const nameEl = ctrl.row.querySelector(".cc-name") as HTMLElement;
-      nameEl.textContent = c.name;
       const connected = c.connected;
       const isMic = !!c.claimedBy && scene.activeMicClientId === c.claimedBy;
       const speaking = scene.currentSpeaker === c.id && scene.phase === "speaking";
+
+      ctrl.avatar.textContent = initials(c.name);
+      ctrl.name.textContent = c.name;
+      ctrl.card.className =
+        "char-card" + (speaking ? " speaking" : isMic ? " mic" : connected ? " connected" : "");
       ctrl.dot.className =
         "dot " + (speaking ? "speaking" : isMic ? "listening" : connected ? "connected" : "off");
-      const bits: string[] = [];
-      bits.push(connected ? `played by ${c.claimedByLabel ?? "player"}` : "not connected");
-      if (isMic) bits.push("ACTIVE MIC");
+
+      const bits: string[] = [
+        connected ? `Played by ${c.claimedByLabel ?? "player"}` : "Not connected",
+      ];
+      if (isMic) bits.push("active mic");
       if (speaking) bits.push("speaking");
       ctrl.status.textContent = bits.join(" · ");
-      ctrl.micBtn.disabled = !connected || !scene.running;
+
+      ctrl.micBtn.textContent = isMic ? "On mic" : "Set mic";
+      ctrl.micBtn.disabled = !connected || !scene.running || isMic;
     }
   }
 
   function update(state: AppState): void {
     currentVoices = state.voices;
     currentScene = state.scene;
-    if (!seeded) {
-      seeded = true;
-      if (rowsContainer.children.length === 0) {
-        addRow();
-        addRow();
+    const scene = state.scene;
+
+    if (scene?.setting) {
+      settingLine.textContent = `Setting · ${scene.setting}`;
+    } else if (scene && scene.characters.length > 0) {
+      settingLine.textContent = `${scene.characters.length} character${scene.characters.length === 1 ? "" : "s"} · no setting yet`;
+    } else {
+      settingLine.textContent = "No scene yet — use Edit scene to set one up.";
+    }
+
+    const phase = scene?.phase ?? "idle";
+    phaseChip.className = "phase-chip " + phase;
+    phaseLabel.textContent = phase;
+
+    let speakerText = "";
+    if (scene) {
+      if (scene.phase === "speaking" && scene.currentSpeaker) {
+        const sp = scene.characters.find((c) => c.id === scene.currentSpeaker);
+        if (sp) speakerText = `Speaking · ${sp.name}`;
+      } else if (scene.running && scene.activeMicClientId) {
+        const mic = scene.characters.find((c) => c.claimedBy === scene.activeMicClientId);
+        if (mic) speakerText = `Mic · ${mic.name}`;
       }
     }
-    const scene = state.scene;
-    phaseBadge.textContent = scene ? scene.phase : "idle";
-    phaseBadge.className = "badge " + (scene?.phase ?? "idle");
-    chainBadge.textContent = scene && scene.running ? `NPC turns: ${scene.npcChainCount}` : "";
+    speakerEl.textContent = speakerText;
+    speakerEl.style.display = speakerText ? "" : "none";
+
+    chainEl.textContent = scene && scene.running ? `NPC turns: ${scene.npcChainCount}` : "";
+    chainEl.style.display = chainEl.textContent ? "" : "none";
+
     startBtn.disabled = !scene || scene.characters.length === 0 || !!scene.running;
     stopBtn.disabled = !scene?.running;
+
+    const errCount = state.errors.length;
+    errorsSummary.textContent = errCount ? `Provider errors (${errCount})` : "Provider errors";
 
     renderCharControls(state);
     renderTranscript(transcriptEl, state);

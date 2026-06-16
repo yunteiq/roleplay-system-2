@@ -52,6 +52,34 @@ export function clear(el: HTMLElement): void {
 }
 
 // ---------------------------------------------------------------------------
+// Icons + avatars (ported from roleplay-director)
+// ---------------------------------------------------------------------------
+
+/**
+ * Renders an SVG asset from /assets as a square, monochrome icon that inherits
+ * the current text color. The SVG is used as a CSS mask over a `currentColor`
+ * block, so the icon always matches the color of the text it sits next to.
+ */
+export function icon(name: string, size = 20): HTMLElement {
+  const mask = `url(/assets/${name}.svg) center / contain no-repeat`;
+  return h("span", {
+    class: "icon",
+    "aria-hidden": "true",
+    style: { width: `${size}px`, height: `${size}px`, webkitMask: mask, mask },
+  });
+}
+
+/** Up-to-two-letter initials for an avatar (first + last word). */
+export function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  const first = parts[0];
+  if (!first) return "?";
+  if (parts.length === 1) return first.slice(0, 2).toUpperCase();
+  const last = parts[parts.length - 1] ?? first;
+  return ((first[0] ?? "") + (last[0] ?? "")).toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
 // Shared app state + action callbacks
 // ---------------------------------------------------------------------------
 

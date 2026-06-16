@@ -1,5 +1,5 @@
 import * as esbuild from "esbuild";
-import { copyFile, mkdir, watch as fsWatch } from "node:fs/promises";
+import { copyFile, cp, mkdir, watch as fsWatch } from "node:fs/promises";
 
 const watch = process.argv.includes("--watch");
 const outdir = "public";
@@ -24,6 +24,8 @@ const workletOpts = {
 async function copyAssets() {
   await copyFile("src/client/index.html", "public/index.html");
   await copyFile("src/client/styles.css", "public/styles.css");
+  await cp("src/client/assets", "public/assets", { recursive: true });
+  await copyFile("src/client/favicon.png", "public/favicon.png").catch(() => {});
 }
 
 if (watch) {
@@ -36,7 +38,7 @@ if (watch) {
   (async () => {
     try {
       for await (const ev of fsWatch("src/client", { recursive: true })) {
-        if (ev.filename && /\.(html|css)$/.test(ev.filename)) {
+        if (ev.filename && /\.(html|css|svg|png)$/.test(ev.filename)) {
           await copyAssets().catch(() => {});
         }
       }

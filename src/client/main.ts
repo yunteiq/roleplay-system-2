@@ -2,7 +2,7 @@ import type { CharacterInit, ServerToClient } from "../shared/types.ts";
 import { WS } from "./ws.ts";
 import { Capture } from "./audio/capture.ts";
 import { Playback } from "./audio/playback.ts";
-import type { Actions, AppState, View } from "./ui.ts";
+import { h, type Actions, type AppState, type View } from "./ui.ts";
 import { createLobbyView } from "./views/lobby.ts";
 import { createHostView } from "./views/host.ts";
 import { createCharacterView } from "./views/character.ts";
@@ -40,6 +40,25 @@ const state: AppState = {
 };
 
 const appRoot = document.getElementById("app")!;
+
+// Persistent app shell: branded topbar over a swappable view mount. Ported
+// from roleplay-director (brand wordmark + "Internal tool for" HP IQ logo).
+const brand = h("div", { class: "brand-link" }, h("div", { class: "brand" }, "DEMO 4.0"));
+brand.addEventListener("click", () => actions.enterLobby());
+const topbar = h(
+  "div",
+  { class: "topbar" },
+  brand,
+  h(
+    "div",
+    { class: "byline" },
+    h("span", null, "Internal tool for"),
+    h("img", { class: "hp-logo", src: "/assets/hp-iq.svg", alt: "hp IQ" }),
+  ),
+);
+const viewMount = h("div", { class: "view-mount" });
+appRoot.replaceChildren(topbar, viewMount);
+
 let currentView: View | null = null;
 
 let rafPending = false;
@@ -64,7 +83,7 @@ function rebuildView(): void {
   else if (state.role === "character") view = createCharacterView(actions);
   else view = createLobbyView(actions);
   currentView = view;
-  appRoot.replaceChildren(view.el);
+  viewMount.replaceChildren(view.el);
   view.update(state);
 }
 
