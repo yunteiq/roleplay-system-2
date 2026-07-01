@@ -8,6 +8,8 @@ import { log, errMsg } from "./log.ts";
 import { getTlsMaterial, lanIPv4s } from "./tls.ts";
 import { validateProviderKeys } from "./providers/clients.ts";
 import { Hub } from "./hub.ts";
+import { advertiseH4Discovery } from "./mdns.ts";
+import type { HumanFloorMode } from "../shared/types.ts";
 
 function isFatalListenError(e: unknown): e is NodeJS.ErrnoException {
   const code = (e as NodeJS.ErrnoException | null)?.code;
@@ -41,9 +43,42 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   validateProviderKeys();
 
+  const hub = new Hub();
+
   const publicDir = resolve("public");
   const app = express();
   app.disable("x-powered-by");
+  app.use(express.json({ limit: "256kb" }));
+
+  // H4 gesture-remote bridge. The on-device H4 app discovers this server via mDNS
+  // (_roleplay._tcp) and POSTs floor-mode events here:
+  //   { kind: "device_directed" | "device_mediated", phase: "start" | "end", action?: string }
+  // `phase:"start"` enters the hold (characters silent / waiting); `phase:"end"`
+  // returns the floor to the characters.
+  app.post("/api/h4/event", (req, res) => {
+    const body = (req.body ?? {}) as { kind?: string; phase?: string; action?: string };
+    let mode: HumanFloorMode;
+    if (body.phase === "end") {
+      mode = "direct";
+    } else if (body.kind === "device_directed" || body.kind === "device_mediated") {
+      mode = body.kind;
+    } else {
+      res.status(400).json({
+        error: "Expected { kind: 'device_directed'|'device_mediated', phase: 'start'|'end' }",
+      });
+      return;
+    }
+    hub.setFloor(mode, body.action);
+    res.json({ ok: true, mode, action: mode === "direct" ? undefined : body.action });
+  });
+
+  // H4 heartbeat: the device pings this periodically so the UI can show whether
+  // an H4 is currently connected (presence times out if pings stop).
+  app.post("/api/h4/ping", (_req, res) => {
+    hub.noteH4Ping();
+    res.json({ ok: true });
+  });
+
   app.use(express.static(publicDir, { index: "index.html" }));
   // SPA fallback: serve the app shell for any other GET.
   app.use((_req, res) => {
@@ -56,7 +91,6 @@ async function main(): Promise<void> {
     : createHttpServer(app);
 
   const wss = new WebSocketServer({ server, path: "/ws", perMessageDeflate: false });
-  const hub = new Hub();
   wss.on("connection", (ws, req) => {
     try {
       hub.handleConnection(ws, req);
@@ -93,6 +127,8 @@ async function main(): Promise<void> {
     if (!cfg.openaiApiKey) {
       log.warn("OPENAI_API_KEY is missing — set it in .env to enable STT/dialogue/TTS.");
     }
+    // Advertise over mDNS so the H4 gesture remote auto-discovers us on the LAN.
+    advertiseH4Discovery(cfg.port, scheme);
   });
 }
 

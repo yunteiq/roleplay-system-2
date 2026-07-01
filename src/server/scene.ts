@@ -3,10 +3,12 @@ import type {
   CharacterInit,
   CharacterState,
   ClientInfo,
+  HumanFloorMode,
   Role,
   SceneState,
   ServerToClient,
   Phase,
+  TurnChannel,
 } from "../shared/types.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { log, errMsg } from "./log.ts";
@@ -25,6 +27,8 @@ import { transcriptToLines, type RoledLine } from "./providers/llm.ts";
 const MAX_TRANSCRIPT = 100;
 const MAX_CONTEXT_LINES = 24;
 const MAX_HISTORY_LINES = 12;
+/** Mark the H4 disconnected if no ping/event arrives within this window. */
+const H4_PRESENCE_TIMEOUT_MS = 12_000;
 
 /** Minimal view of a connected client that the scene needs. */
 export interface ClientRecord {
@@ -81,10 +85,44 @@ export class Scene {
   private spec: SpecDialogue | null = null;
   private directorSpec: SpecDirector | null = null;
 
+  /** clientId whose TTS is still audibly playing. While set, ALL mic input is
+   *  held back from STT so no one transcribes the speaker's output (including
+   *  its buffered tail). Cleared when that client reports `audioStopped`. */
+  private playbackActiveClient: string | null = null;
+  private playbackSafety: NodeJS.Timeout | null = null;
+  /** A queued NPC chain step waiting for the current speaker's audio to actually
+   *  finish playing before it starts, so characters never talk over each other. */
+  private pendingChain: { lastCharacterId: string; gen: number } | null = null;
+  /** Timer for the human-intervention listening window between NPC turns. */
+  private chainTimer: NodeJS.Timeout | null = null;
+  /** Echo strategy. "legacy" (default): gate STT during playback (half-duplex) —
+   *  required for mics without echo cancellation (e.g. the H4), so a character's
+   *  own TTS never leaks back into STT. "aec": trust the client's echo
+   *  cancellation and keep the mic open. Set by the client via setAudioMode. */
+  private audioMode: "aec" | "legacy" = "legacy";
+
   private utteranceId = "";
   private partialText = "";
+  /** Floor mode latched while the current utterance is being spoken. Used to
+   *  classify it when the STT final lands, which can be after an H4 hold has
+   *  already been released (the final lags the release) — so the device
+   *  interaction is still routed correctly instead of leaking into the scene. */
+  private utteranceFloor: HumanFloorMode = "direct";
   /** Bumped on any control change so async continuations can detect supersession. */
   private gen = 0;
+
+  /** The device's relayed reply captured during a device_mediated hold, answered
+   *  on release. (The floor mode itself lives on the scene state: floorMode.) */
+  private pendingMediated: { text: string; uid: string } | null = null;
+  /** Count of final utterances seen since entering the current device_mediated
+   *  hold. The 1st is the human's private query to the device ("Query for H4");
+   *  the device's spoken reply ("H4 response") follows and is what's relayed. */
+  private mediatedFinals = 0;
+
+  /** Whether an H4 device is currently connected (heartbeat-based). Kept off the
+   *  scene object so it survives scene re-creation; merged into getState(). */
+  private h4Connected = false;
+  private h4DisconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(private clients: SceneClients) {
     this.cfg = loadConfig();
@@ -101,6 +139,8 @@ export class Scene {
       activeMicClientId: null,
       currentSpeaker: null,
       npcChainCount: 0,
+      floorMode: "direct",
+      h4Connected: false,
       transcript: [],
       connectedClients: [],
     };
@@ -121,7 +161,7 @@ export class Scene {
       ...c,
       connected: !!c.claimedBy && !!this.clients.getClient(c.claimedBy),
     }));
-    return { ...this.scene, characters, connectedClients };
+    return { ...this.scene, h4Connected: this.h4Connected, characters, connectedClients };
   }
 
   private broadcastScene(): void {
@@ -137,16 +177,28 @@ export class Scene {
     this.clients.broadcast({ t: "error", message, scope });
   }
 
-  private liveTranscript(speaker: string, name: string, text: string, final: boolean): void {
-    this.clients.broadcast({ t: "transcript", speaker, name, text, final });
+  private liveTranscript(
+    speaker: string,
+    name: string,
+    text: string,
+    final: boolean,
+    channel?: TurnChannel,
+  ): void {
+    this.clients.broadcast({ t: "transcript", speaker, name, text, final, channel });
   }
 
-  private addTranscript(speaker: string, name: string, text: string, final: boolean): void {
-    this.scene.transcript.push({ id: nanoid(8), speaker, name, text, ts: Date.now(), final });
+  private addTranscript(
+    speaker: string,
+    name: string,
+    text: string,
+    final: boolean,
+    channel?: TurnChannel,
+  ): void {
+    this.scene.transcript.push({ id: nanoid(8), speaker, name, text, ts: Date.now(), final, channel });
     if (this.scene.transcript.length > MAX_TRANSCRIPT) {
       this.scene.transcript.splice(0, this.scene.transcript.length - MAX_TRANSCRIPT);
     }
-    this.liveTranscript(speaker, name, text, final);
+    this.liveTranscript(speaker, name, text, final, channel);
   }
 
   // -------------------------------------------------------------------------
@@ -209,26 +261,42 @@ export class Scene {
       this.clients.send(clientId, { t: "role", role: "host", characterId: null });
     }
     this.stopInternal();
-    const characters: CharacterState[] = inits.map((c) => ({
-      id: nanoid(8),
-      name: c.name.trim() || "Unnamed",
-      persona: c.persona ?? "",
-      voice: c.voice || "alloy",
-      aliases: (c.aliases ?? []).map((a) => a.trim()).filter(Boolean),
-      secret: c.secret?.trim() || undefined,
-      claimedBy: null,
-      claimedByLabel: null,
-      connected: false,
-    }));
+    // Carry claims across the swap so players keep their role when the host
+    // switches scenarios mid-session. A claimed character in the previous cast
+    // is matched to a same-named character in the new cast (case-insensitive),
+    // preserving its id so the claiming client's characterId stays valid.
+    const prev = this.scene.characters.filter((c) => c.claimedBy);
+    const carried = new Set<string>();
+    const characters: CharacterState[] = inits.map((c) => {
+      const name = c.name.trim() || "Unnamed";
+      const match = prev.find(
+        (p) => !carried.has(p.id) && p.name.toLowerCase() === name.toLowerCase(),
+      );
+      if (match) carried.add(match.id);
+      return {
+        id: match?.id ?? nanoid(8),
+        name,
+        persona: c.persona ?? "",
+        voice: c.voice || "alloy",
+        aliases: (c.aliases ?? []).map((a) => a.trim()).filter(Boolean),
+        secret: c.secret?.trim() || undefined,
+        claimedBy: match?.claimedBy ?? null,
+        claimedByLabel: match?.claimedByLabel ?? null,
+        connected: false,
+      };
+    });
     this.scene = {
       ...this.emptyScene(),
       id: nanoid(8),
       setting: setting.trim(),
       characters,
     };
-    // Any clients that were playing old characters return to the lobby.
+    // Reconcile character-role clients: keep anyone whose claim carried over
+    // (their characterId is unchanged); send everyone else back to the lobby.
     for (const c of this.clients.clients()) {
-      if (c.role === "character") {
+      if (c.role !== "character") continue;
+      const kept = characters.some((ch) => ch.id === c.characterId && ch.claimedBy === c.id);
+      if (!kept) {
         this.clients.setClientRole(c.id, "lobby", null);
         this.clients.send(c.id, { t: "role", role: "lobby", characterId: null });
       }
@@ -289,6 +357,7 @@ export class Scene {
       this.active = null;
     }
     this.releaseClaimsOf(clientId);
+    if (this.playbackActiveClient === clientId) this.clearPlayback();
     if (this.scene.activeMicClientId === clientId) {
       this.scene.activeMicClientId = null;
       this.assignDefaultMic();
@@ -342,6 +411,9 @@ export class Scene {
     }
     this.active = null;
     this.abortSpeculative();
+    this.pendingChain = null;
+    this.clearChainTimer();
+    this.clearPlayback();
     if (this.scene.activeMicClientId) {
       this.clients.send(this.scene.activeMicClientId, {
         t: "listen",
@@ -359,13 +431,13 @@ export class Scene {
   // Active mic
   // -------------------------------------------------------------------------
 
-  handleSetActiveMic(clientId: string, targetClientId: string): void {
-    if (!this.requireHost(clientId)) return;
-    if (!this.clients.getClient(targetClientId)) {
-      this.clients.send(clientId, { t: "error", message: "Target client not connected", scope: "mic" });
-      return;
-    }
-    this.setActiveMicInternal(targetClientId);
+  /** A client reports it actually started playing audio (it's outputting now).
+   *  The active mic follows audio output: make this machine the mic, and keep it
+   *  there until a different machine starts outputting audio. */
+  onAudioStarted(clientId: string): void {
+    if (!this.scene.running) return;
+    if (!this.clients.getClient(clientId)) return;
+    this.setActiveMicInternal(clientId);
   }
 
   private setActiveMicInternal(clientId: string | null): void {
@@ -413,19 +485,90 @@ export class Scene {
     this.stt = null;
   }
 
+  setAudioMode(mode: "aec" | "legacy"): void {
+    this.audioMode = mode;
+    log.info(`audio mode: ${mode}`);
+  }
+
   onMicFrame(clientId: string, buf: Buffer): void {
     if (!this.scene.running) return;
     if (clientId !== this.scene.activeMicClientId) return;
+    // Legacy (half-duplex): hold all input while a character's TTS is playing so
+    // the speaker's own output (and its tail) is never transcribed back. In AEC
+    // mode the client cancels its own echo, so we keep the mic open for
+    // full-duplex voice barge-in.
+    if (this.audioMode === "legacy" && this.playbackActiveClient) return;
     this.stt?.appendPcm(buf);
+  }
+
+  /** A client reports its TTS playback buffer has fully drained (audio truly
+   *  stopped). Re-open STT and drop any boundary audio captured meanwhile. */
+  onAudioStopped(clientId: string): void {
+    this.releasePlayback(clientId);
+  }
+
+  /** Called when the playing client's audio truly stops (report or safety
+   *  timeout): reopen STT and start the deferred next NPC, if any. */
+  private releasePlayback(clientId: string): void {
+    if (this.playbackActiveClient !== clientId) return;
+    this.clearPlayback();
+    this.stt?.clearInput();
+    const pending = this.pendingChain;
+    if (pending && pending.gen === this.gen && this.scene.running) {
+      this.pendingChain = null;
+      // Open a listening window so a human can intervene before the next NPC
+      // speaks. No audio plays during this gap, so it's echo-safe. If the human
+      // stays silent, the chain continues; if they speak, scheduleChain is
+      // cancelled and their utterance is routed instead.
+      this.setPhase("listening");
+      this.broadcastScene();
+      this.scheduleChain(pending.lastCharacterId, this.gen);
+    }
+  }
+
+  private scheduleChain(lastCharacterId: string, gen: number): void {
+    this.clearChainTimer();
+    this.chainTimer = setTimeout(() => {
+      this.chainTimer = null;
+      // Skip if a human spoke (gen bumped), the scene changed, or we're no
+      // longer simply listening (someone already started speaking/thinking).
+      if (gen !== this.gen || !this.scene.running || this.scene.phase !== "listening") return;
+      void this.afterTurn(lastCharacterId);
+    }, this.cfg.npcChainGapMs);
+  }
+
+  private clearChainTimer(): void {
+    if (this.chainTimer) {
+      clearTimeout(this.chainTimer);
+      this.chainTimer = null;
+    }
+  }
+
+  private clearPlayback(): void {
+    this.playbackActiveClient = null;
+    if (this.playbackSafety) {
+      clearTimeout(this.playbackSafety);
+      this.playbackSafety = null;
+    }
   }
 
   private onSpeechStarted(): void {
     if (!this.scene.running) return;
-    if (this.cfg.bargeIn && (this.scene.phase === "speaking" || this.scene.phase === "thinking")) {
+    // Never interrupt a character that is audibly mid-line. Detected speech here
+    // is either a human in the room or the character's own TTS leaking back
+    // through a mic without echo cancellation (e.g. the H4); in both cases the
+    // committed line must finish. (Mic input is also gated during playback — see
+    // onMicFrame — so this guard is rarely reached, but it also fences the tail.)
+    if (this.playbackActiveClient) return;
+    // A human is speaking — cancel any queued NPC chain so they can intervene.
+    this.clearChainTimer();
+    if (this.cfg.bargeIn && this.scene.phase === "thinking") {
       this.bargeIn();
     }
     this.utteranceId = nanoid(8);
     this.partialText = "";
+    // Latch the floor mode for this utterance now, while it is being spoken.
+    this.utteranceFloor = this.scene.floorMode;
     this.abortSpeculative();
     this.gen++;
     this.setPhase("listening");
@@ -446,6 +589,11 @@ export class Scene {
 
   private onSttFinal(text: string): void {
     if (!this.scene.running) return;
+    // Drop a transcript that completed while a character was still audibly
+    // speaking: it's the character's own TTS echoing back (no AEC on the H4), or
+    // a human talking over a committed line — never input we act on. Letting it
+    // through here would supersede and cut off the speaking turn.
+    if (this.playbackActiveClient) return;
     void this.processHumanUtterance(text.trim(), this.utteranceId);
   }
 
@@ -454,6 +602,9 @@ export class Scene {
   // -------------------------------------------------------------------------
 
   private speculate(text: string): void {
+    // While the human is addressing the device (any non-direct floor), never
+    // pre-start character work — they're either silent or waiting.
+    if (this.scene.floorMode !== "direct") return;
     if (!this.cfg.speculativeDirector && !this.cfg.speculativeDialogue) return;
     const words = countWords(text);
     const candidates = this.connectedCharacters();
@@ -555,17 +706,25 @@ export class Scene {
       this.clients.send(clientId, { t: "error", message: "Start the scene first", scope: "scene" });
       return;
     }
+    this.clearChainTimer();
     if (this.scene.phase === "speaking" || this.scene.phase === "thinking") {
       this.bargeIn();
     }
     this.utteranceId = nanoid(8);
     this.partialText = "";
+    this.utteranceFloor = this.scene.floorMode;
     this.gen++;
     void this.processHumanUtterance(text.trim(), this.utteranceId);
   }
 
   private async processHumanUtterance(finalText: string, uid: string): Promise<void> {
     if (!this.scene.running) return;
+    // Classify by the floor mode latched when the utterance was spoken, not the
+    // live one — the H4 hold is often released before this (latency-delayed)
+    // final arrives. Reset the latch for the next utterance.
+    const floor = this.utteranceFloor;
+    this.utteranceFloor = this.scene.floorMode;
+
     if (!finalText) {
       this.clearSpecRefs();
       if (this.active && !this.active.committed) {
@@ -577,9 +736,62 @@ export class Scene {
       return;
     }
 
+    // H4 floor: the human was talking TO their device (Ask / Vision / dictation).
+    // Log it as a private aside the characters never perceive, and don't respond.
+    if (floor === "device_directed") {
+      this.addTranscript("human", "Human", finalText, true, "to_device");
+      this.setPhase("listening");
+      this.broadcastScene();
+      return;
+    }
+
+    // H4 "via device" floor: the human first speaks a query TO the device, then
+    // the device speaks its reply aloud (captured as the next utterance). The
+    // query is a private aside ("Query for H4"); the device's reply ("H4
+    // response") is what gets relayed into the conversation on the person's
+    // behalf and responded to. Characters stay silent until the hold is released.
+    if (floor === "device_mediated") {
+      this.mediatedFinals++;
+      if (this.mediatedFinals === 1) {
+        // First utterance of the hold: the human's query to the device. Private —
+        // never perceived by the characters, never answered.
+        this.addTranscript("human", "Human", finalText, true, "query_for_device");
+        this.setPhase("listening");
+        this.broadcastScene();
+        return;
+      }
+      // Subsequent utterance(s): the device speaking its reply. Relay it into the
+      // conversation as the person's contribution. Respond on release; if the
+      // hold was already let go before this (latency-delayed) final landed,
+      // respond now.
+      this.addTranscript("human", "Human", finalText, true, "via_device");
+      this.scene.npcChainCount = 0;
+      const text = this.pendingMediated
+        ? `${this.pendingMediated.text} ${finalText}`.trim()
+        : finalText;
+      this.pendingMediated = { text, uid };
+      if (this.scene.floorMode === "direct") {
+        const pending = this.pendingMediated;
+        this.pendingMediated = null;
+        await this.respondToHuman(pending.text, pending.uid);
+      } else {
+        this.setPhase("listening");
+        this.broadcastScene();
+      }
+      return;
+    }
+
     this.addTranscript("human", "Human", finalText, true);
     this.scene.npcChainCount = 0;
+    await this.respondToHuman(finalText, uid);
+  }
 
+  /**
+   * Route an already-recorded human line to a responder and start its turn.
+   * Used for normal input and on release of a device_mediated hold.
+   */
+  private async respondToHuman(finalText: string, uid: string): Promise<void> {
+    if (!this.scene.running) return;
     const candidates = this.connectedCharacters();
     if (candidates.length === 0) {
       this.surfaceError("No connected characters to respond.", "scene");
@@ -679,6 +891,84 @@ export class Scene {
   }
 
   // -------------------------------------------------------------------------
+  // H4 floor mode (gesture remote + web fallback)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record an H4 heartbeat or event: (re)mark it connected and arm the
+   * disconnect timeout. Called by the REST ping and any H4-sourced floor event.
+   */
+  noteH4Seen(): void {
+    if (!this.h4Connected) {
+      this.h4Connected = true;
+      this.broadcastScene();
+      log.info("H4 connected");
+    }
+    if (this.h4DisconnectTimer) clearTimeout(this.h4DisconnectTimer);
+    this.h4DisconnectTimer = setTimeout(() => this.markH4Disconnected(), H4_PRESENCE_TIMEOUT_MS);
+  }
+
+  private markH4Disconnected(): void {
+    if (this.h4DisconnectTimer) {
+      clearTimeout(this.h4DisconnectTimer);
+      this.h4DisconnectTimer = null;
+    }
+    if (!this.h4Connected) return;
+    this.h4Connected = false;
+    this.broadcastScene();
+    log.info("H4 disconnected (no heartbeat)");
+  }
+
+  /**
+   * Set who the human is addressing. Entering a hold (device_directed /
+   * device_mediated) cuts any in-flight character work so they fall silent;
+   * returning to "direct" responds to the device's relayed reply captured during
+   * a device_mediated hold, if any.
+   */
+  setFloorMode(mode: HumanFloorMode, action?: string, source: "h4" | "web" = "web"): void {
+    // Any H4-sourced floor change is also a heartbeat (proves the device is live).
+    if (source === "h4") this.noteH4Seen();
+    const nextAction = mode === "direct" ? undefined : action;
+    if (mode === this.scene.floorMode && nextAction === this.scene.floorAction) {
+      if (mode !== "direct" && this.scene.floorSource !== source) {
+        this.scene.floorSource = source;
+        this.broadcastScene();
+      }
+      return;
+    }
+    const prev = this.scene.floorMode;
+    this.scene.floorMode = mode;
+    this.scene.floorAction = nextAction;
+    this.scene.floorSource = mode === "direct" ? undefined : source;
+
+    if (mode !== "direct") {
+      // Entering a hold: silence the characters immediately.
+      this.pendingMediated = null;
+      // Restart the via-device sequence so the first utterance of this hold is
+      // treated as the human's query and the device's reply follows.
+      this.mediatedFinals = 0;
+      // Latch the hold onto the in-flight (or imminent) utterance so a final that
+      // lands after the hold is released is still routed as a device interaction.
+      this.utteranceFloor = mode;
+      this.bargeIn();
+      if (this.scene.running) this.setPhase("listening");
+      this.broadcastScene();
+      log.info(`floor mode: ${mode}${action ? ` (${action})` : ""}`);
+      return;
+    }
+
+    // Returning the floor to the characters.
+    const pending = this.pendingMediated;
+    this.pendingMediated = null;
+    this.broadcastScene();
+    log.info("floor mode: direct");
+    if (prev === "device_mediated" && pending && this.scene.running) {
+      this.gen++;
+      void this.respondToHuman(pending.text, pending.uid);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Turn execution
   // -------------------------------------------------------------------------
 
@@ -690,6 +980,8 @@ export class Scene {
     chain: boolean;
     scripted?: string;
   }): ActiveTurn | null {
+    // A turn is starting — cancel any pending inter-turn intervention window.
+    this.clearChainTimer();
     const char = this.getCharacter(opts.characterId);
     if (!char || !char.claimedBy || !this.isConnected(char)) return null;
     const clientId = char.claimedBy;
@@ -715,7 +1007,8 @@ export class Scene {
     this.active = turn;
     this.scene.currentSpeaker = opts.characterId;
     this.setPhase("thinking");
-    if (opts.commit) this.setActiveMicInternal(clientId);
+    // The active mic is NOT switched here — it follows actual audio output and
+    // moves only when a client reports audioStarted (see onAudioStarted).
     this.broadcastScene();
 
     void this.runTurnLoop(turn, char, opts.lines, opts.chain, opts.scripted);
@@ -729,7 +1022,6 @@ export class Scene {
       turn.committed = true;
     }
     this.scene.npcChainCount = 1;
-    this.setActiveMicInternal(turn.clientId);
     if (turn.finished && !turn.abort.signal.aborted) {
       this.recordReply(turn);
       void this.afterTurn(turn.characterId);
@@ -781,6 +1073,17 @@ export class Scene {
       if (turn.begun) return;
       turn.begun = true;
       this.setPhase("speaking");
+      // Committed audio is now playing on this client: hold STT until it reports
+      // the audio actually stopped (see onAudioStopped / onMicFrame gate). We do
+      // NOT gate for speculative turns, which play while the human is still
+      // talking and must not cut off the human's own input.
+      if (turn.committed) {
+        this.playbackActiveClient = clientId;
+        if (this.playbackSafety) {
+          clearTimeout(this.playbackSafety);
+          this.playbackSafety = null;
+        }
+      }
       this.clients.send(clientId, {
         t: "speakBegin",
         characterId: turn.characterId,
@@ -886,13 +1189,30 @@ export class Scene {
         characterId: turn.characterId,
         turnId: turn.turnId,
       });
+      // Safety net: if the client's audioStopped report is lost, release the STT
+      // hold (and resume any deferred chain) after a generous window so things
+      // can never get stuck closed.
+      if (this.playbackActiveClient === clientId) {
+        if (this.playbackSafety) clearTimeout(this.playbackSafety);
+        this.playbackSafety = setTimeout(() => {
+          this.releasePlayback(clientId);
+        }, 8000);
+      }
     }
 
     if (turn.committed) {
       this.recordReply(turn);
       if (this.active === turn) this.active = null;
       if (chain) {
-        void this.afterTurn(turn.characterId);
+        if (turn.begun && this.playbackActiveClient === turn.clientId) {
+          // Audio is still playing out on the client (TTS streams faster than
+          // realtime, so a whole line is buffered). Defer the next character
+          // until it actually finishes — resumed in releasePlayback — so NPCs
+          // don't talk over each other.
+          this.pendingChain = { lastCharacterId: turn.characterId, gen: this.gen };
+        } else {
+          void this.afterTurn(turn.characterId);
+        }
       } else {
         if (this.scene.running) this.setPhase("listening");
         this.broadcastScene();
@@ -959,6 +1279,10 @@ export class Scene {
     }
     this.active = null;
     this.abortSpeculative();
+    // Audio is being dropped — release the STT hold and cancel any deferred chain.
+    this.pendingChain = null;
+    this.clearChainTimer();
+    this.clearPlayback();
   }
 
   private stopTurnAudio(turn: ActiveTurn): void {
@@ -971,15 +1295,24 @@ export class Scene {
   // Helpers
   // -------------------------------------------------------------------------
 
+  /** Private device asides the characters never perceive: the operator's words
+   *  spoken TO the device (ASK) and the via-device query. They only ever hear the
+   *  device's relayed reply ("via_device"). */
+  private isPrivateAside(channel?: TurnChannel): boolean {
+    return channel === "to_device" || channel === "query_for_device";
+  }
+
   private buildLines(extra?: RoledLine): RoledLine[] {
-    const base = transcriptToLines(this.scene.transcript.filter((e) => e.final));
+    const base = transcriptToLines(
+      this.scene.transcript.filter((e) => e.final && !this.isPrivateAside(e.channel)),
+    );
     const trimmed = base.slice(-MAX_CONTEXT_LINES);
     return extra ? [...trimmed, extra] : trimmed;
   }
 
   private historyText(): string {
     return this.scene.transcript
-      .filter((e) => e.final)
+      .filter((e) => e.final && !this.isPrivateAside(e.channel))
       .slice(-MAX_HISTORY_LINES)
       .map((e) => `${e.name}: ${e.text}`)
       .join("\n");

@@ -37,6 +37,8 @@ function systemPrompt(setting: string, c: DialogueCharacter): string {
     "Avoid long opening clauses. Avoid filler unless it fits your character.",
     "Do not revise text you already said. Stay fully in character.",
     "Keep replies short and conversational, like real speech.",
+    "Speak in 1-2 sentences unless explicitly asked for more detail.",
+    "Maximum 80 words per response.",
     "Output only spoken words — no stage directions, names, or markdown.",
   ];
   return parts.filter(Boolean).join("\n");
@@ -55,7 +57,9 @@ async function* openaiDialogue(req: DialogueRequest): AsyncGenerator<string> {
     ],
   };
   if (isReasoningModel(model)) {
-    params.reasoning_effort = "minimal";
+    // "low" (not "minimal"): newer reasoning models (e.g. gpt-5.x) dropped
+    // "minimal"; "low" is accepted across the o-series and gpt-5 families.
+    params.reasoning_effort = "low";
     params.verbosity = "low";
     params.max_completion_tokens = 400;
   } else {

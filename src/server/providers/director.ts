@@ -85,7 +85,9 @@ async function openaiDirector(
     response_format: { type: "json_object" },
   };
   if (isReasoningModel(model)) {
-    params.reasoning_effort = "minimal";
+    // "low" (not "minimal"): newer reasoning models (e.g. gpt-5.x) dropped
+    // "minimal"; "low" is accepted across the o-series and gpt-5 families.
+    params.reasoning_effort = "low";
     params.max_completion_tokens = 60;
   } else {
     params.temperature = 0;

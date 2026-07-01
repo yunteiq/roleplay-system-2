@@ -1,5 +1,7 @@
 import {
+  createFloorWidget,
   h,
+  icon,
   initials,
   renderErrors,
   renderTranscript,
@@ -8,6 +10,7 @@ import {
   type View,
 } from "../ui.ts";
 import type { CharacterInit } from "../../shared/types.ts";
+import { EXAMPLES, exampleCast } from "../library.ts";
 import { openCreateScene } from "./create-scene.ts";
 
 interface CharCtrl {
@@ -16,13 +19,13 @@ interface CharCtrl {
   name: HTMLElement;
   dot: HTMLElement;
   status: HTMLElement;
-  micBtn: HTMLButtonElement;
   sayInput: HTMLInputElement;
 }
 
 export function createHostView(actions: Actions): View {
   let currentVoices: string[] = [];
   let currentScene: AppState["scene"] = null;
+  const floor = createFloorWidget(actions);
 
   function editScene(): void {
     const scene = currentScene;
@@ -40,6 +43,56 @@ export function createHostView(actions: Actions): View {
       submitLabel: "Update scene",
     });
   }
+
+  // ---- Scenario quick-switch --------------------------------------------
+  // Loads a preset scenario (setting + cast) into the current session without
+  // reopening the editor. Players holding a character that also exists in the
+  // new scenario (matched by name) keep their role; everyone else returns to
+  // the lobby. The scene loads idle — press Start to run it.
+  const scenarioMenu = h("div", { class: "example-menu" });
+  scenarioMenu.hidden = true;
+  let scenarioOpen = false;
+  const scenarioBtn = h(
+    "button",
+    {
+      class: "pillbtn white",
+      type: "button",
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      onClick: (e: Event) => {
+        e.stopPropagation();
+        setScenarioOpen(!scenarioOpen);
+      },
+    },
+    "Scenarios",
+    icon("chevron-down", 14),
+  );
+  function setScenarioOpen(v: boolean): void {
+    scenarioOpen = v;
+    scenarioMenu.hidden = !v;
+    scenarioBtn.setAttribute("aria-expanded", String(v));
+  }
+  for (const ex of EXAMPLES) {
+    scenarioMenu.appendChild(
+      h(
+        "button",
+        {
+          type: "button",
+          class: "example-item",
+          onClick: () => {
+            setScenarioOpen(false);
+            actions.createScene(ex.setting, exampleCast(ex));
+          },
+        },
+        h("span", { class: "ex-title" }, ex.title),
+        h("span", { class: "ex-desc" }, ex.description),
+      ),
+    );
+  }
+  const scenarioPicker = h("div", { class: "example-picker" }, scenarioBtn, scenarioMenu);
+  document.addEventListener("click", (e: MouseEvent) => {
+    if (scenarioOpen && !scenarioPicker.contains(e.target as Node)) setScenarioOpen(false);
+  });
 
   // ---- Header ------------------------------------------------------------
   const settingLine = h("div", { class: "muted small dir-setting" });
@@ -97,7 +150,13 @@ export function createHostView(actions: Actions): View {
       "div",
       { class: "create-head" },
       h("h1", { class: "col-title" }, "Director controls"),
-      h("div", { class: "head-actions" }, editBtn, leaveBtn),
+      h(
+        "div",
+        { class: "head-actions" },
+        ...(EXAMPLES.length ? [scenarioPicker] : []),
+        editBtn,
+        leaveBtn,
+      ),
     ),
     settingLine,
     h(
@@ -106,6 +165,7 @@ export function createHostView(actions: Actions): View {
       h("div", { class: "dir-status" }, phaseChip, speakerEl, chainEl),
       h("div", { class: "dir-transport" }, startBtn, stopBtn, resetBtn),
     ),
+    floor.el,
     h(
       "div",
       { class: "dir-stage" },
@@ -134,11 +194,6 @@ export function createHostView(actions: Actions): View {
     const name = h("span", { class: "cc-name" });
     const dot = h("span", { class: "dot" });
     const status = h("span", { class: "cc-status" });
-    const micBtn = h(
-      "button",
-      { class: "btn small", onClick: () => onSetMic(charId) },
-      "Set mic",
-    ) as HTMLButtonElement;
     const sayInput = h("input", { class: "input", placeholder: "Make them say…" }) as HTMLInputElement;
     const say = () => {
       const t = sayInput.value.trim();
@@ -165,17 +220,11 @@ export function createHostView(actions: Actions): View {
       h(
         "div",
         { class: "cc-actions" },
-        micBtn,
         h("div", { class: "cc-say" }, sayInput, sayBtn),
       ),
     );
     card.dataset.for = charId;
-    return { card, avatar, name, dot, status, micBtn, sayInput };
-  }
-
-  function onSetMic(charId: string): void {
-    const ch = currentScene?.characters.find((c) => c.id === charId);
-    if (ch?.claimedBy) actions.setActiveMic(ch.claimedBy);
+    return { card, avatar, name, dot, status, sayInput };
   }
 
   function renderCharControls(state: AppState): void {
@@ -217,9 +266,6 @@ export function createHostView(actions: Actions): View {
       if (isMic) bits.push("active mic");
       if (speaking) bits.push("speaking");
       ctrl.status.textContent = bits.join(" · ");
-
-      ctrl.micBtn.textContent = isMic ? "On mic" : "Set mic";
-      ctrl.micBtn.disabled = !connected || !scene.running || isMic;
     }
   }
 
@@ -263,6 +309,7 @@ export function createHostView(actions: Actions): View {
     errorsSummary.textContent = errCount ? `Provider errors (${errCount})` : "Provider errors";
 
     renderCharControls(state);
+    floor.update(state);
     renderTranscript(transcriptEl, state);
     renderErrors(errorsEl, state);
   }

@@ -118,6 +118,9 @@ a:hover { color: var(--text-2); }
 .byline { display: flex; align-items: center; gap: var(--s-2); }
 .byline span { color: var(--text-3); font-size: var(--fs-sm); }
 .hp-logo { height: 30px; width: auto; object-fit: contain; display: block; }
+.mode-toggle { background: var(--surface-2); color: var(--text-3); }
+.mode-toggle:hover { background: var(--surface-3); color: var(--text); }
+.mode-toggle[data-mode="aec"] { color: var(--accent); }
 
 /* The active view fills the space between the topbar and the page bottom. */
 .view-mount { flex: 1; display: flex; flex-direction: column; min-height: 0; }
@@ -136,6 +139,7 @@ h3 { font-size: var(--fs-sm); color: var(--text-3); letter-spacing: 0.02em; }
 .view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
 .row { display: flex; gap: var(--s-3); align-items: center; flex-wrap: wrap; }
+.row > h1, .row > h2, .row > h3 { margin: 0; }
 .row.tight { gap: var(--s-2); }
 .row.space { justify-content: space-between; }
 .row.end { justify-content: flex-end; }
@@ -288,7 +292,25 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 /* ====================================================================== */
 .create-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s-4); }
 .col-title { font-size: var(--fs-lg); color: var(--text); margin: 0; }
-.head-actions { display: flex; gap: var(--s-2); }
+.head-actions { display: flex; align-items: center; gap: var(--s-2); }
+
+/* "Load example" popover menu (shown when several examples are available). */
+.example-picker { position: relative; display: inline-flex; }
+.example-menu {
+  position: absolute; top: calc(100% + var(--s-2)); right: 0; z-index: 60;
+  min-width: 300px; max-width: 380px;
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--r-md); box-shadow: var(--shadow);
+  padding: var(--s-1); display: flex; flex-direction: column; gap: 2px;
+}
+.example-menu[hidden] { display: none; }
+.example-item {
+  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  background: transparent; border-radius: var(--r-sm); padding: var(--s-2) var(--s-3);
+}
+.example-item:hover { background: var(--surface-3); }
+.example-item .ex-title { font-size: var(--fs-sm); color: var(--text); }
+.example-item .ex-desc { font-size: var(--fs-sm); color: var(--text-3); line-height: var(--lh); }
 
 .scene-cast {
   display: grid; grid-template-columns: 1fr 1px var(--cast-w, 42%);
@@ -467,7 +489,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .character-view { width: 380px; max-width: 100%; margin: 0 auto; }
 .character-view .transcript { max-height: 260px; }
 
-.persona { margin: var(--s-1) 0 var(--s-3); }
 .status-big {
   text-align: center; font-size: 24px; letter-spacing: 0.04em;
   padding: var(--s-5) var(--s-3); border-radius: var(--r-md); margin: var(--s-3) 0;
@@ -538,3 +559,31 @@ body:has(.overlay) { overflow: hidden; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s-3); }
 .modal-head h2 { margin: 0; }
 .modal-actions { display: flex; justify-content: flex-end; gap: var(--s-2); margin-top: var(--s-4); }
+
+/* ====================================================================== */
+/* H4 floor mode (gesture remote + web fallback)                           */
+/* ====================================================================== */
+.floor-widget { display: flex; flex-direction: column; gap: var(--s-2); }
+.floor-widget .btn.active { background: var(--accent); color: var(--on-accent); }
+.floor-banner {
+  border-radius: var(--r-md);
+  padding: var(--s-2) var(--s-3);
+  font-size: var(--fs-sm);
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+}
+.floor-banner.device_directed { border-left-color: #d08770; }
+.floor-banner.device_mediated { border-left-color: #7bafe9; }
+.line.aside { background: transparent; opacity: 0.72; font-style: italic; }
+.line.aside .who { color: var(--text-3); }
+.line.via-device { box-shadow: inset 2px 0 0 #7bafe9; }
+.chan-tag { color: var(--text-3); font-size: var(--fs-sm); }
+
+/* H4 presence pill (topbar) */
+.h4-pill { display: inline-flex; align-items: center; gap: var(--s-1); }
+.h4-pill::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: currentColor; display: inline-block;
+}
+.h4-pill.ok { color: var(--listening); }
+.h4-pill.off { color: var(--text-3); }

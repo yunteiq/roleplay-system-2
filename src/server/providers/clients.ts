@@ -46,7 +46,9 @@ export function validateProviderKeys(): void {
   if (!cfg.openaiApiKey) {
     log.warn("OPENAI_API_KEY is not set — STT/director/dialogue/TTS will fail until provided.");
   }
-  const usesGemini = [cfg.directorModel, cfg.dialogueModel].some((m) => m.provider === "gemini");
+  const usesGemini = [cfg.directorModel, cfg.dialogueModel, cfg.ttsModel].some(
+    (m) => m.provider === "gemini",
+  );
   if (usesGemini && !cfg.geminiApiKey) {
     log.warn("A gemini: model is configured but GEMINI_API_KEY is not set.");
   }

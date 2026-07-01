@@ -16,6 +16,35 @@ const capture = new Capture();
 const playback = new Playback();
 let audioCtx: AudioContext | null = null;
 
+// Detect when TTS audio has ACTUALLY stopped (the playback ring buffer drained
+// after speakEnd, plus a short tail for speaker/DAC settle) and report it to the
+// server. The server holds STT for everyone until then, so the speaker's own
+// output — including its buffered tail — is never transcribed back as input.
+let ttsEnded = false;
+let playbackEmpty = true;
+let audioStopTimer: ReturnType<typeof setTimeout> | undefined;
+const PLAYBACK_TAIL_MS = 500;
+
+function reportAudioStoppedWhenIdle(): void {
+  if (!ttsEnded || !playbackEmpty) return;
+  clearTimeout(audioStopTimer);
+  audioStopTimer = setTimeout(() => {
+    ttsEnded = false;
+    ws.sendJson({ t: "audioStopped" });
+  }, PLAYBACK_TAIL_MS);
+}
+
+function onPlaybackDrained(): void {
+  playbackEmpty = true;
+  reportAudioStoppedWhenIdle();
+}
+
+function onPlaybackStarted(): void {
+  // This machine is now outputting audio — tell the server so it makes us the
+  // active mic (the mic follows whoever is currently speaking).
+  ws.sendJson({ t: "audioStarted" });
+}
+
 const state: AppState = {
   clientId: "",
   role: "lobby",
@@ -41,10 +70,43 @@ const state: AppState = {
 
 const appRoot = document.getElementById("app")!;
 
+// ---- Audio mode A/B switch (Legacy half-duplex vs AEC full-duplex) ----------
+const AUDIO_MODE_KEY = "npc.audioMode";
+type AudioMode = "aec" | "legacy";
+// Default to Legacy (half-duplex, echo-safe): the server gates the mic while an
+// NPC is talking, so a mic without echo cancellation (e.g. the H4) can't feed the
+// character's own TTS back into STT. Only an explicit AEC choice opts in.
+let audioMode: AudioMode = localStorage.getItem(AUDIO_MODE_KEY) === "aec" ? "aec" : "legacy";
+
+const audioModeBtn = h("button", {
+  class: "btn small mode-toggle",
+  title:
+    "Echo strategy. Legacy: half-duplex (mic muted while an NPC talks). " +
+    "AEC: full-duplex echo cancellation (talk over NPCs). Changing re-joins audio.",
+  onClick: () => setAudioMode(audioMode === "aec" ? "legacy" : "aec"),
+}) as HTMLButtonElement;
+
+function renderAudioMode(): void {
+  audioModeBtn.textContent = audioMode === "aec" ? "Audio: AEC" : "Audio: Legacy";
+  audioModeBtn.dataset.mode = audioMode;
+}
+
+function setAudioMode(mode: AudioMode): void {
+  audioMode = mode;
+  localStorage.setItem(AUDIO_MODE_KEY, mode);
+  ws.sendJson({ t: "setAudioMode", mode });
+  renderAudioMode();
+  // Rebuild the audio pipeline cleanly under the new mode for a clean A/B test.
+  if (state.audioJoined) location.reload();
+}
+renderAudioMode();
+
 // Persistent app shell: branded topbar over a swappable view mount. Ported
 // from roleplay-director (brand wordmark + "Internal tool for" HP IQ logo).
 const brand = h("div", { class: "brand-link" }, h("div", { class: "brand" }, "DEMO 4.0"));
 brand.addEventListener("click", () => actions.enterLobby());
+// Live H4 presence indicator (driven by the device's heartbeat).
+const h4Pill = h("span", { class: "badge h4-pill off" }, "H4 not connected");
 const topbar = h(
   "div",
   { class: "topbar" },
@@ -52,10 +114,18 @@ const topbar = h(
   h(
     "div",
     { class: "byline" },
+    h4Pill,
+    audioModeBtn,
     h("span", null, "Internal tool for"),
     h("img", { class: "hp-logo", src: "/assets/hp-iq.svg", alt: "hp IQ" }),
   ),
 );
+
+function updateH4Indicator(): void {
+  const connected = !!state.scene?.h4Connected;
+  h4Pill.textContent = connected ? "H4 connected" : "H4 not connected";
+  h4Pill.className = "badge h4-pill " + (connected ? "ok" : "off");
+}
 const viewMount = h("div", { class: "view-mount" });
 appRoot.replaceChildren(topbar, viewMount);
 
@@ -106,11 +176,36 @@ const actions: Actions = {
   start: () => ws.sendJson({ t: "startScene" }),
   stop: () => ws.sendJson({ t: "stopScene" }),
   reset: () => ws.sendJson({ t: "resetScene" }),
-  setActiveMic: (clientId) => ws.sendJson({ t: "setActiveMic", clientId }),
   humanText: (text) => ws.sendJson({ t: "humanText", text }),
   injectLine: (characterId, text) => ws.sendJson({ t: "injectLine", characterId, text }),
   joinAudio: () => void joinAudio(),
+  setFloor: (mode, action) => ws.sendJson({ t: "setFloor", mode, action }),
 };
+
+// H4 floor remote keyboard shortcuts (hold A = talk to device, hold T = via
+// device). Wired once globally; the on-screen buttons do the same over pointer.
+const floorKeys = new Set<string>();
+const isTypingTarget = (t: EventTarget | null): boolean => {
+  const tag = (t as HTMLElement | null)?.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA";
+};
+window.addEventListener("keydown", (e) => {
+  if (e.repeat || isTypingTarget(e.target)) return;
+  const k = e.key.toLowerCase();
+  if (k === "a" && !floorKeys.has("a")) {
+    floorKeys.add("a");
+    actions.setFloor("device_directed", "ASK");
+  } else if (k === "t" && !floorKeys.has("t")) {
+    floorKeys.add("t");
+    actions.setFloor("device_mediated", "TRANSLATION");
+  }
+});
+window.addEventListener("keyup", (e) => {
+  const k = e.key.toLowerCase();
+  if ((k === "a" && floorKeys.delete("a")) || (k === "t" && floorKeys.delete("t"))) {
+    if (floorKeys.size === 0) actions.setFloor("direct");
+  }
+});
 
 async function joinAudio(): Promise<void> {
   if (state.audioJoined) return;
@@ -118,7 +213,11 @@ async function joinAudio(): Promise<void> {
     audioCtx = new AudioContext({ sampleRate: state.audio.sampleRate });
     await audioCtx.resume();
     await audioCtx.audioWorklet.addModule("/worklet.js");
-    playback.init(audioCtx, state.audio.playbackPrefillMs);
+    await playback.init(audioCtx, state.audio.playbackPrefillMs, {
+      aec: audioMode === "aec",
+      onStarted: onPlaybackStarted,
+      onDrained: onPlaybackDrained,
+    });
     const frameSamples = Math.round((state.audio.sampleRate * state.audio.micFrameMs) / 1000);
     await capture.start(audioCtx, frameSamples, {
       onLevel: (rms) => {
@@ -126,6 +225,8 @@ async function joinAudio(): Promise<void> {
         currentView?.updateMeter?.(rms);
       },
       onFrame: (pcm) => {
+        // The server gates STT while audio is playing (until we report
+        // audioStopped), so we can stream the mic whenever we're the active mic.
         if (state.isActiveMic) ws.sendBinary(pcm);
       },
     });
@@ -152,6 +253,8 @@ function onMessage(msg: ServerToClient): void {
       state.clientId = msg.clientId;
       state.audio = msg.audio;
       state.voices = msg.voices;
+      // Sync our chosen echo strategy to the server (drives its STT gating).
+      ws.sendJson({ t: "setAudioMode", mode: audioMode });
       render();
       break;
     case "role": {
@@ -170,15 +273,26 @@ function onMessage(msg: ServerToClient): void {
       render();
       break;
     case "speakBegin":
+      clearTimeout(audioStopTimer);
+      ttsEnded = false;
+      playbackEmpty = false;
       state.receivingAudio = true;
       render();
       break;
     case "speakEnd":
+      // Server finished sending; the buffer is usually still draining. We report
+      // audioStopped to the server once it actually drains (onPlaybackDrained).
+      ttsEnded = true;
       state.receivingAudio = false;
+      reportAudioStoppedWhenIdle();
       render();
       break;
     case "stopAudio":
+      // Barge-in / hard stop: the server already dropped audio and reopened input.
+      clearTimeout(audioStopTimer);
       playback.stop();
+      ttsEnded = false;
+      playbackEmpty = true;
       state.receivingAudio = false;
       render();
       break;
@@ -197,6 +311,7 @@ function onMessage(msg: ServerToClient): void {
 
 function handleScene(scene: AppState["scene"]): void {
   state.scene = scene;
+  updateH4Indicator();
   if (scene) {
     if (scene.transcript.length === 0) {
       state.transcript = [];
@@ -204,14 +319,14 @@ function handleScene(scene: AppState["scene"]): void {
     } else if (state.transcript.length === 0) {
       state.transcript = scene.transcript
         .filter((e) => e.final)
-        .map((e) => ({ speaker: e.speaker, name: e.name, text: e.text }));
+        .map((e) => ({ speaker: e.speaker, name: e.name, text: e.text, channel: e.channel }));
     }
   }
   render();
 }
 
 function handleTranscript(msg: Extract<ServerToClient, { t: "transcript" }>): void {
-  const line = { speaker: msg.speaker, name: msg.name, text: msg.text };
+  const line = { speaker: msg.speaker, name: msg.name, text: msg.text, channel: msg.channel };
   if (msg.final) {
     state.transcript.push(line);
     if (state.transcript.length > 200) state.transcript.splice(0, state.transcript.length - 200);
@@ -224,7 +339,10 @@ function handleTranscript(msg: Extract<ServerToClient, { t: "transcript" }>): vo
 
 ws.onJson(onMessage);
 ws.onBinary((buf) => {
-  if (state.receivingAudio) playback.push(buf);
+  if (state.receivingAudio) {
+    playbackEmpty = false;
+    playback.push(buf);
+  }
 });
 ws.onClose(() => {
   state.isActiveMic = false;

@@ -65,6 +65,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
   private playing = false;
   private prefill: number;
   private hardCap: number;
+  // Tracks whether the buffer is idle (empty + already reported). Drives the
+  // "started"/"drained" edges: a push out of idle = a new playback session
+  // begins; the buffer running dry = the session ends.
+  private idle = true;
 
   constructor(options?: PlaybackOptions) {
     super();
@@ -73,6 +77,11 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (e: MessageEvent) => {
       const d = e.data as { type: string; pcm?: ArrayBuffer };
       if (d.type === "push" && d.pcm) {
+        if (this.idle) {
+          // First audio of a new playback session — report that output is starting.
+          this.idle = false;
+          this.port.postMessage({ type: "started" });
+        }
         const count = Math.floor(d.pcm.byteLength / 2);
         const i16 = new Int16Array(d.pcm, 0, count);
         const f = new Float32Array(i16.length);
@@ -89,6 +98,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.readOffset = 0;
         this.queued = 0;
         this.playing = false;
+        this.idle = true;
       }
     };
   }
@@ -123,6 +133,15 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       }
     }
     for (let i = written; i < n; i++) out[i] = 0;
+
+    // Report the moment the ring buffer runs dry (real end of audio output), so
+    // the main thread can tell when playback has actually stopped — distinct from
+    // when the server merely finished sending. Fires once per drain. `playing`
+    // stays true so the next session resumes gaplessly.
+    if (this.playing && this.queue.length === 0 && !this.idle) {
+      this.idle = true;
+      this.port.postMessage({ type: "drained" });
+    }
     return true;
   }
 }

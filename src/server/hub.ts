@@ -4,7 +4,7 @@ import { z } from "zod";
 import { nanoid } from "nanoid";
 import { loadConfig, audioConfig } from "./config.ts";
 import { log, errMsg } from "./log.ts";
-import { VOICES, type Role, type ServerToClient } from "../shared/types.ts";
+import { VOICES, type HumanFloorMode, type Role, type ServerToClient } from "../shared/types.ts";
 import { Scene, type ClientRecord, type SceneClients } from "./scene.ts";
 
 interface Conn extends ClientRecord {
@@ -32,9 +32,16 @@ const zClientToServer = z.discriminatedUnion("t", [
   z.object({ t: z.literal("startScene") }),
   z.object({ t: z.literal("stopScene") }),
   z.object({ t: z.literal("resetScene") }),
-  z.object({ t: z.literal("setActiveMic"), clientId: z.string() }),
   z.object({ t: z.literal("humanText"), text: z.string() }),
   z.object({ t: z.literal("injectLine"), characterId: z.string(), text: z.string() }),
+  z.object({
+    t: z.literal("setFloor"),
+    mode: z.enum(["direct", "device_directed", "device_mediated"]),
+    action: z.string().optional(),
+  }),
+  z.object({ t: z.literal("setAudioMode"), mode: z.enum(["aec", "legacy"]) }),
+  z.object({ t: z.literal("audioStarted") }),
+  z.object({ t: z.literal("audioStopped") }),
   z.object({ t: z.literal("ping") }),
 ]);
 
@@ -52,6 +59,16 @@ export class Hub implements SceneClients {
 
   constructor() {
     this.scene = new Scene(this);
+  }
+
+  /** Set the H4 floor mode from an external source (default: the H4 REST bridge). */
+  setFloor(mode: HumanFloorMode, action?: string, source: "h4" | "web" = "h4"): void {
+    this.scene.setFloorMode(mode, action, source);
+  }
+
+  /** Record an H4 heartbeat (the device's periodic /api/h4/ping). */
+  noteH4Ping(): void {
+    this.scene.noteH4Seen();
   }
 
   // ---- SceneClients implementation ----------------------------------------
@@ -192,14 +209,24 @@ export class Hub implements SceneClients {
         case "resetScene":
           this.scene.handleReset(id);
           break;
-        case "setActiveMic":
-          this.scene.handleSetActiveMic(id, msg.clientId);
-          break;
         case "humanText":
           this.scene.handleHumanText(id, msg.text);
           break;
         case "injectLine":
           this.scene.handleInjectLine(id, msg.characterId, msg.text);
+          break;
+        case "setFloor":
+          // Web fallback remote (not the physical H4).
+          this.scene.setFloorMode(msg.mode, msg.action, "web");
+          break;
+        case "setAudioMode":
+          this.scene.setAudioMode(msg.mode);
+          break;
+        case "audioStarted":
+          this.scene.onAudioStarted(id);
+          break;
+        case "audioStopped":
+          this.scene.onAudioStopped(id);
           break;
         default:
           break;

@@ -1,8 +1,8 @@
-import { h, renderTranscript, type Actions, type AppState, type View } from "../ui.ts";
+import { createFloorWidget, h, renderTranscript, type Actions, type AppState, type View } from "../ui.ts";
 
 export function createCharacterView(actions: Actions): View {
+  const floor = createFloorWidget(actions);
   const titleEl = h("h1", null, "Character");
-  const personaEl = h("p", { class: "persona muted" });
   const joinBtn = h("button", { class: "btn primary big", onClick: () => actions.joinAudio() }, "Join audio");
   const statusEl = h("div", { class: "status-big waiting" }, "WAITING");
   const micBadge = h("span", { class: "badge" }, "mic off");
@@ -18,19 +18,18 @@ export function createCharacterView(actions: Actions): View {
       "div",
       { class: "card" },
       h("div", { class: "row space" }, titleEl, micBadge),
-      personaEl,
       joinBtn,
       statusEl,
       h("div", { class: "meter-row" }, h("span", { class: "muted" }, "Mic level"), meter),
       h("div", { class: "row" }, leaveBtn),
     ),
+    floor.el,
     h("div", { class: "card" }, h("h3", null, "Live transcript"), transcriptEl),
   );
 
   function update(state: AppState): void {
     const ch = state.scene?.characters.find((c) => c.id === state.characterId);
     titleEl.textContent = ch ? ch.name : "Character";
-    personaEl.textContent = ch?.persona ?? "";
     joinBtn.style.display = state.audioJoined ? "none" : "";
 
     let status = "WAITING";
@@ -55,6 +54,7 @@ export function createCharacterView(actions: Actions): View {
       : "mic off";
     micBadge.className = "badge " + (state.isActiveMic ? "listening" : "");
 
+    floor.update(state);
     renderTranscript(transcriptEl, state);
   }
 

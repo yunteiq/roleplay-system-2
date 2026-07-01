@@ -1,8 +1,10 @@
 import type {
   AudioConfig,
   CharacterInit,
+  HumanFloorMode,
   Role,
   SceneState,
+  TurnChannel,
 } from "../shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -87,6 +89,7 @@ export interface TranscriptLine {
   speaker: string;
   name: string;
   text: string;
+  channel?: TurnChannel;
 }
 
 export interface AppState {
@@ -116,10 +119,10 @@ export interface Actions {
   start(): void;
   stop(): void;
   reset(): void;
-  setActiveMic(clientId: string): void;
   humanText(text: string): void;
   injectLine(characterId: string, text: string): void;
   joinAudio(): void;
+  setFloor(mode: HumanFloorMode, action?: string): void;
 }
 
 export interface View {
@@ -137,12 +140,29 @@ export function renderTranscript(container: HTMLElement, state: AppState): void 
     container.scrollTop + container.clientHeight >= container.scrollHeight - 40;
   clear(container);
   for (const line of state.transcript) {
+    if (line.channel === "to_device" || line.channel === "query_for_device") {
+      // Private aside the human spoke TO their device — italic, dimmed, labeled.
+      // Either the ASK aside or the via-device query; never seen by characters.
+      const label = line.channel === "query_for_device" ? "[Query for H4] " : "[to device] ";
+      container.appendChild(
+        h(
+          "div",
+          { class: "line aside" },
+          h("span", { class: "who" }, label),
+          h("span", { class: "what" }, `${line.name}: “${line.text}”`),
+        ),
+      );
+      continue;
+    }
+    const base = line.speaker === "human" ? "line human" : "line npc";
+    // "via_device" is the device's spoken reply relayed on the person's behalf.
     container.appendChild(
       h(
         "div",
-        { class: line.speaker === "human" ? "line human" : "line npc" },
+        { class: line.channel === "via_device" ? `${base} via-device` : base },
         h("span", { class: "who" }, `${line.name}: `),
         h("span", { class: "what" }, line.text),
+        line.channel === "via_device" ? h("span", { class: "chan-tag" }, " H4 response") : null,
       ),
     );
   }
@@ -168,4 +188,88 @@ export function renderErrors(container: HTMLElement, state: AppState): void {
   for (const e of state.errors.slice(-8).reverse()) {
     container.appendChild(h("div", { class: "error-line" }, e));
   }
+}
+
+/**
+ * Web fallback for the H4 gesture remote: a banner + two press-and-hold buttons
+ * that flip the session floor mode (the real H4 drives the same thing over the
+ * LAN). Press-and-hold mirrors H4 hold semantics — the mode is active only while
+ * held. Keyboard A / T are wired once in main.ts.
+ */
+export function createFloorWidget(actions: Actions): { el: HTMLElement; update(state: AppState): void } {
+  const status = h("span", { class: "badge" }, "direct");
+  const banner = h("div", { class: "floor-banner", style: { display: "none" } });
+
+  function hold(label: string, title: string, mode: HumanFloorMode, action: string): HTMLButtonElement {
+    let held = false;
+    const btn = h("button", { class: "btn small", title }, label) as HTMLButtonElement;
+    const start = (e: Event) => {
+      e.preventDefault();
+      if (held) return;
+      held = true;
+      actions.setFloor(mode, action);
+    };
+    const end = () => {
+      if (!held) return;
+      held = false;
+      actions.setFloor("direct");
+    };
+    btn.addEventListener("pointerdown", start);
+    btn.addEventListener("pointerup", end);
+    btn.addEventListener("pointerleave", end);
+    btn.addEventListener("pointercancel", end);
+    return btn;
+  }
+
+  const askBtn = hold(
+    "Hold · Talk to device",
+    "Ask / Vision — characters pause; your words are logged as a private aside (key: A)",
+    "device_directed",
+    "ASK",
+  );
+  const transBtn = hold(
+    "Hold · Speak via device",
+    "Via device — speak your query (private), then the device replies aloud; characters respond to the device's reply when you release (key: T)",
+    "device_mediated",
+    "TRANSLATION",
+  );
+
+  const el = h(
+    "div",
+    { class: "card floor-widget" },
+    banner,
+    h(
+      "div",
+      { class: "row space" },
+      h("span", { class: "field-label" }, "H4 floor (test remote)"),
+      status,
+    ),
+    h("div", { class: "row" }, askBtn, transBtn),
+  );
+
+  function update(state: AppState): void {
+    const mode = state.scene?.floorMode ?? "direct";
+    const action = state.scene?.floorAction;
+    const source = state.scene?.floorSource;
+    status.textContent = mode;
+    status.className = "badge " + (mode === "direct" ? "" : "listening");
+    askBtn.classList.toggle("active", mode === "device_directed");
+    transBtn.classList.toggle("active", mode === "device_mediated");
+    if (mode === "direct") {
+      banner.style.display = "none";
+      banner.textContent = "";
+    } else {
+      const by = source === "h4" ? " · via H4" : source === "web" ? " · web remote" : "";
+      banner.style.display = "";
+      banner.className = "floor-banner " + mode;
+      banner.textContent =
+        (mode === "device_directed"
+          ? "Human is talking to the device — characters paused."
+          : "Speaking via the device — the query stays private; the device's reply goes to the characters when you release.") +
+        (action ? ` (${action})` : "") +
+        by;
+    }
+  }
+
+  return { el, update };
 }

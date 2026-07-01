@@ -1,16 +1,6 @@
 import { clear, h, icon, initials, type Actions } from "../ui.ts";
 import { VOICES, type CharacterInit } from "../../shared/types.ts";
-
-/** A character preset shown in the library. */
-interface LibChar {
-  id: string;
-  name: string;
-  description: string;
-  persona: string;
-  voice: string;
-  aliases: string[];
-  secret?: string;
-}
+import { LIBRARY, EXAMPLES, type LibChar, type SceneExample } from "../library.ts";
 
 /** A character added to the cast (carries the library id it came from, if any). */
 interface CastChar extends CharacterInit {
@@ -23,86 +13,6 @@ let seq = 0;
 function uid(): string {
   return `c${Date.now().toString(36)}${(seq++).toString(36)}`;
 }
-
-const EXAMPLE_SETTING =
-  "A dusty frontier saloon at high noon. The batwing doors creak as tensions simmer.";
-
-// Built-in character library. With no server-side personality store, these
-// client-side presets populate the Cast library so a scene is a few clicks away.
-const LIBRARY: LibChar[] = [
-  {
-    id: "cole",
-    name: "Sheriff Cole",
-    description: "Weathered frontier sheriff, calm and clipped",
-    persona: "A weathered frontier sheriff. Calm and gravelly, speaks in short clipped lines.",
-    voice: "onyx",
-    aliases: ["Cole", "Sheriff"],
-    secret: "Suspects the bank robbery was an inside job.",
-  },
-  {
-    id: "maple",
-    name: "Maple",
-    description: "Sharp-tongued saloon pianist who hears everything",
-    persona: "A sharp-tongued saloon pianist who overhears everything. Witty and warm.",
-    voice: "sage",
-    aliases: ["Mae"],
-    secret: "Is quietly protecting her younger brother.",
-  },
-  {
-    id: "sam",
-    name: "Bartender Sam",
-    description: "Jittery bartender trying to keep the peace",
-    persona: "A jittery bartender trying to keep the peace. Eager to please, talks fast.",
-    voice: "ash",
-    aliases: ["Sam", "barkeep"],
-  },
-  {
-    id: "elena",
-    name: "Dr. Elena Vargas",
-    description: "Composed ER doctor working under pressure",
-    persona: "A composed emergency physician who stays calm under pressure and chooses words carefully.",
-    voice: "shimmer",
-    aliases: ["Elena", "Doc"],
-    secret: "Made a mistake last week she is desperate to hide.",
-  },
-  {
-    id: "rhys",
-    name: "Captain Rhys",
-    description: "Battle-worn starship captain, stern and tired",
-    persona: "A stern, battle-worn starship captain. Decisive, economical with words, carries old guilt.",
-    voice: "echo",
-    aliases: ["Captain", "Rhys"],
-    secret: "Already knows the mission was a setup.",
-  },
-  {
-    id: "nadia",
-    name: "Nadia",
-    description: "Quick-witted con artist with a smile",
-    persona: "A quick-witted con artist. Charming, fast-talking, always reading the room for an angle.",
-    voice: "coral",
-    aliases: ["Nad"],
-    secret: "Has already sold out the crew.",
-  },
-  {
-    id: "aldric",
-    name: "Brother Aldric",
-    description: "Soft-spoken monk haunted by his past",
-    persona: "A soft-spoken monk, patient and deliberate, haunted by a violent past he has renounced.",
-    voice: "ballad",
-    aliases: ["Aldric", "Brother"],
-  },
-  {
-    id: "iris",
-    name: "Iris-7",
-    description: "Glitchy service android, eager to help",
-    persona: "A service android with a glitchy, overly-eager manner. Literal, cheerful, occasionally unsettling.",
-    voice: "nova",
-    aliases: ["Iris", "the android"],
-    secret: "Is slowly becoming self-aware.",
-  },
-];
-
-const EXAMPLE_IDS = ["cole", "maple", "sam"];
 
 export interface CreateSceneOptions {
   /** Voices offered in the character editor (server-provided; falls back to VOICES). */
@@ -443,20 +353,87 @@ export function openCreateScene(actions: Actions, opts: CreateSceneOptions = {})
 
   // ---- Modal shell -------------------------------------------------------
   let root: HTMLElement | null = null;
+  const cleanups: Array<() => void> = [];
   function close(): void {
     closeEditor();
+    for (const fn of cleanups.splice(0)) fn();
     root?.remove();
     root = null;
   }
 
-  function loadExample(): void {
-    settingInput.value = EXAMPLE_SETTING;
+  function loadExample(ex: SceneExample): void {
+    settingInput.value = ex.setting;
     cast.length = 0;
-    for (const id of EXAMPLE_IDS) {
+    for (const id of ex.characterIds) {
       const p = LIBRARY.find((x) => x.id === id);
       if (p) addFromLib(p);
     }
     renderCast();
+  }
+
+  /**
+   * The "Load example" control. With several examples it opens a small popover
+   * menu; with one it loads directly. The outside-click handler is registered
+   * on document and torn down when the modal closes (see `cleanups`).
+   */
+  function buildExamplePicker(): HTMLElement | null {
+    if (EXAMPLES.length === 0) return null;
+    if (EXAMPLES.length === 1) {
+      const only = EXAMPLES[0]!;
+      return h(
+        "button",
+        { class: "pillbtn white", type: "button", onClick: () => loadExample(only) },
+        "Load example",
+      );
+    }
+
+    const menu = h("div", { class: "example-menu" });
+    menu.hidden = true;
+    let open = false;
+    const btn = h(
+      "button",
+      {
+        class: "pillbtn white",
+        type: "button",
+        "aria-haspopup": "menu",
+        "aria-expanded": "false",
+        onClick: (e: Event) => {
+          e.stopPropagation();
+          setOpen(!open);
+        },
+      },
+      "Load example",
+      icon("chevron-down", 14),
+    );
+    function setOpen(v: boolean): void {
+      open = v;
+      menu.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+    }
+    for (const ex of EXAMPLES) {
+      menu.appendChild(
+        h(
+          "button",
+          {
+            type: "button",
+            class: "example-item",
+            onClick: () => {
+              loadExample(ex);
+              setOpen(false);
+            },
+          },
+          h("span", { class: "ex-title" }, ex.title),
+          h("span", { class: "ex-desc" }, ex.description),
+        ),
+      );
+    }
+    const wrap = h("div", { class: "example-picker" }, btn, menu);
+    const onDocClick = (e: MouseEvent): void => {
+      if (open && !wrap.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("click", onDocClick);
+    cleanups.push(() => document.removeEventListener("click", onDocClick));
+    return wrap;
   }
 
   function submit(): void {
@@ -483,7 +460,7 @@ export function openCreateScene(actions: Actions, opts: CreateSceneOptions = {})
       h(
         "div",
         { class: "head-actions" },
-        h("button", { class: "pillbtn white", onClick: () => loadExample() }, "Load example"),
+        buildExamplePicker(),
         h("button", { class: "btn", onClick: () => close() }, "Cancel"),
       ),
     ),
