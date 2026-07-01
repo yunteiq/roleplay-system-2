@@ -27,8 +27,10 @@ import { transcriptToLines, type RoledLine } from "./providers/llm.ts";
 const MAX_TRANSCRIPT = 100;
 const MAX_CONTEXT_LINES = 24;
 const MAX_HISTORY_LINES = 12;
-/** Mark the H4 disconnected if no ping/event arrives within this window. */
-const H4_PRESENCE_TIMEOUT_MS = 12_000;
+/** Mark the H4 disconnected if no ping/event arrives within this window. The H4
+ *  pings every 5s; this tolerates several consecutive lost heartbeats so a weak
+ *  Wi-Fi link (latency/packet loss) doesn't make presence flap on/off. */
+const H4_PRESENCE_TIMEOUT_MS = 30_000;
 
 /** Minimal view of a connected client that the scene needs. */
 export interface ClientRecord {
